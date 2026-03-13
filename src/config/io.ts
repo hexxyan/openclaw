@@ -1358,7 +1358,7 @@ let runtimeConfigSourceSnapshot: OpenClawConfig | null = null;
 let runtimeConfigSnapshotRefreshHandler: RuntimeConfigSnapshotRefreshHandler | null = null;
 
 let lastResolvedConfigPath: string | null = null;
-let lastConfigMtimeMs = 0;
+let lastConfigMtimes: Map<string, number> | null = null;
 let lastConfigResult: OpenClawConfig | null = null;
 
 function resolveConfigCacheMs(env: NodeJS.ProcessEnv): number {
@@ -1492,9 +1492,29 @@ export function loadConfig(): OpenClawConfig {
 
   // 3. Disk check (mtimeMs) + Referential Stability
   try {
-    const stat = fs.statSync(configPath);
-    if (stat.mtimeMs === lastConfigMtimeMs && lastConfigResult) {
-      // Referential stability: file unmodified, keep same WeakMap keys alive
+    let mtimesValid = true;
+    if (lastConfigMtimes && lastConfigResult) {
+      for (const [path, lastMtime] of lastConfigMtimes.entries()) {
+        try {
+          const stat = fs.statSync(path);
+          if (stat.mtimeMs !== lastMtime) {
+            mtimesValid = false;
+            break;
+          }
+        } catch {
+          // File deleted or inaccessible
+          if (lastMtime !== 0) {
+            mtimesValid = false;
+            break;
+          }
+        }
+      }
+    } else {
+      mtimesValid = false;
+    }
+
+    if (mtimesValid && lastConfigResult) {
+      // Referential stability: no files modified, keep same WeakMap keys alive
       if (shouldUseConfigCache(env)) {
         configCache = {
           configPath,
@@ -1506,10 +1526,38 @@ export function loadConfig(): OpenClawConfig {
     }
 
     // 4. Full load if modified
-    const io = createConfigIO();
+    const currentMtimes = new Map<string, number>();
+    const trackingFs = {
+      ...fs,
+      readFileSync: (
+        targetPath: fs.PathOrFileDescriptor,
+        options?: Parameters<typeof fs.readFileSync>[1],
+      ) => {
+        const p = targetPath.toString();
+        try {
+          const stat = fs.statSync(p);
+          currentMtimes.set(p, stat.mtimeMs);
+        } catch {
+          currentMtimes.set(p, 0);
+        }
+        return fs.readFileSync(targetPath, options);
+      },
+      existsSync: (targetPath: fs.PathLike) => {
+        const p = targetPath.toString();
+        try {
+          const stat = fs.statSync(p);
+          currentMtimes.set(p, stat.mtimeMs);
+        } catch {
+          currentMtimes.set(p, 0);
+        }
+        return fs.existsSync(targetPath);
+      },
+    } as typeof fs;
+
+    const io = createConfigIO({ fs: trackingFs });
     const config = io.loadConfig();
 
-    lastConfigMtimeMs = stat.mtimeMs;
+    lastConfigMtimes = currentMtimes;
     lastConfigResult = config;
 
     if (shouldUseConfigCache(env)) {
@@ -1520,9 +1568,9 @@ export function loadConfig(): OpenClawConfig {
       };
     }
     return config;
-  } catch (_err) {
+  } catch {
     // Fallback: File doesn't exist or read error
-    lastConfigMtimeMs = 0;
+    lastConfigMtimes = null;
     lastConfigResult = null;
     return createConfigIO().loadConfig();
   }
