@@ -1357,6 +1357,10 @@ let runtimeConfigSnapshot: OpenClawConfig | null = null;
 let runtimeConfigSourceSnapshot: OpenClawConfig | null = null;
 let runtimeConfigSnapshotRefreshHandler: RuntimeConfigSnapshotRefreshHandler | null = null;
 
+let lastResolvedConfigPath: string | null = null;
+let lastConfigMtimeMs = 0;
+let lastConfigResult: OpenClawConfig | null = null;
+
 function resolveConfigCacheMs(env: NodeJS.ProcessEnv): number {
   const raw = env.OPENCLAW_CONFIG_CACHE_MS?.trim();
   if (raw === "" || raw === "0") {
@@ -1468,27 +1472,60 @@ export function loadConfig(): OpenClawConfig {
   if (runtimeConfigSnapshot) {
     return runtimeConfigSnapshot;
   }
-  const io = createConfigIO();
-  const configPath = io.configPath;
+
+  const env = process.env;
   const now = Date.now();
-  if (shouldUseConfigCache(process.env)) {
+
+  // 1. Resolve path (cached permanently at module scope)
+  if (!lastResolvedConfigPath) {
+    lastResolvedConfigPath = createConfigIO().configPath;
+  }
+  const configPath = lastResolvedConfigPath;
+
+  // 2. Memory cache (short-lived TTL)
+  if (shouldUseConfigCache(env)) {
     const cached = configCache;
     if (cached && cached.configPath === configPath && cached.expiresAt > now) {
       return cached.config;
     }
   }
-  const config = io.loadConfig();
-  if (shouldUseConfigCache(process.env)) {
-    const cacheMs = resolveConfigCacheMs(process.env);
-    if (cacheMs > 0) {
+
+  // 3. Disk check (mtimeMs) + Referential Stability
+  try {
+    const stat = fs.statSync(configPath);
+    if (stat.mtimeMs === lastConfigMtimeMs && lastConfigResult) {
+      // Referential stability: file unmodified, keep same WeakMap keys alive
+      if (shouldUseConfigCache(env)) {
+        configCache = {
+          configPath,
+          expiresAt: now + resolveConfigCacheMs(env),
+          config: lastConfigResult,
+        };
+      }
+      return lastConfigResult;
+    }
+
+    // 4. Full load if modified
+    const io = createConfigIO();
+    const config = io.loadConfig();
+
+    lastConfigMtimeMs = stat.mtimeMs;
+    lastConfigResult = config;
+
+    if (shouldUseConfigCache(env)) {
       configCache = {
         configPath,
-        expiresAt: now + cacheMs,
+        expiresAt: now + resolveConfigCacheMs(env),
         config,
       };
     }
+    return config;
+  } catch (_err) {
+    // Fallback: File doesn't exist or read error
+    lastConfigMtimeMs = 0;
+    lastConfigResult = null;
+    return createConfigIO().loadConfig();
   }
-  return config;
 }
 
 export async function readBestEffortConfig(): Promise<OpenClawConfig> {
