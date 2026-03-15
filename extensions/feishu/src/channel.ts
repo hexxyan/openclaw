@@ -32,6 +32,7 @@ import { feishuOnboardingAdapter } from "./onboarding.js";
 import { feishuOutbound } from "./outbound.js";
 import { resolveFeishuGroupToolPolicy } from "./policy.js";
 import { probeFeishu } from "./probe.js";
+import { createFeishuReplyDispatcher } from "./reply-dispatcher.js";
 import { addReactionFeishu, listReactionsFeishu, removeReactionFeishu } from "./reactions.js";
 import { sendCardFeishu, sendMessageFeishu } from "./send.js";
 import { normalizeFeishuTarget, looksLikeFeishuId, formatFeishuTarget } from "./targets.js";
@@ -485,5 +486,17 @@ export const feishuPlugin: ChannelPlugin<ResolvedFeishuAccount> = {
         accountId: ctx.accountId,
       });
     },
+  },
+  createOutboundDispatcher: (params) => {
+    const normalizedTo = normalizeFeishuTarget(params.to) ?? params.to;
+    return createFeishuReplyDispatcher({
+      cfg: params.cfg,
+      agentId: params.agentId,
+      runtime: params.runtime,
+      chatId: normalizedTo,
+      accountId: params.accountId,
+      replyToMessageId: params.replyToId,
+      replyInThread: Boolean(params.threadId),
+    });
   },
 };
