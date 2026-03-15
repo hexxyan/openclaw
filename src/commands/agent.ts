@@ -58,6 +58,8 @@ import {
   isSilentReplyText,
   SILENT_REPLY_TOKEN,
 } from "../auto-reply/tokens.js";
+import { ReplyPayload } from "../auto-reply/types.js";
+import { getChannelPlugin } from "../channels/plugins/index.js";
 import { formatCliCommand } from "../cli/command-format.js";
 import { resolveCommandSecretRefsViaGateway } from "../cli/command-secret-gateway.js";
 import { getAgentRuntimeCommandSecretTargetIds } from "../cli/command-secret-targets.js";
@@ -81,6 +83,7 @@ import {
 } from "../infra/agent-events.js";
 import { buildOutboundSessionContext } from "../infra/outbound/session-context.js";
 import { getRemoteSkillEligibility } from "../infra/skills-remote.js";
+import { PluginRuntime } from "../plugins/runtime/types.js";
 import { normalizeAgentId } from "../routing/session-key.js";
 import { defaultRuntime, type RuntimeEnv } from "../runtime.js";
 import { applyVerboseOverride } from "../sessions/level-overrides.js";
@@ -92,6 +95,7 @@ import { deliverAgentCommandResult } from "./agent/delivery.js";
 import { resolveAgentRunContext } from "./agent/run-context.js";
 import { updateSessionStoreAfterAgentRun } from "./agent/session-store.js";
 import { resolveSession } from "./agent/session.js";
+import { createAgentStreamingBridge } from "./agent/streaming-bridge.js";
 import type { AgentCommandIngressOpts, AgentCommandOpts } from "./agent/types.js";
 
 type PersistSessionEntryParams = {
@@ -392,6 +396,10 @@ function runAgentAttempt(params: {
         );
 
         // Clear the expired session ID from the session store
+
+        /**
+         * Persist a session entry to the session store.
+         */
         const entry = params.sessionStore[params.sessionKey];
         if (entry) {
           const updatedEntry = { ...entry };
@@ -675,6 +683,18 @@ async function prepareAgentCommandExecution(
   };
 }
 
+function getChannelRuntime(channelId: string): unknown {
+  if (channelId === "feishu") {
+    try {
+      // @ts-ignore
+      return require("../../extensions/feishu/src/runtime.js").getFeishuRuntime();
+    } catch {
+      return defaultRuntime;
+    }
+  }
+  return defaultRuntime;
+}
+
 async function agentCommandInternal(
   opts: AgentCommandOpts & { senderIsOwner: boolean },
   runtime: RuntimeEnv = defaultRuntime,
@@ -724,6 +744,33 @@ async function agentCommandInternal(
     if (acpResolution?.kind === "stale") {
       throw acpResolution.error;
     }
+
+    const { replyOptions: bridgeReplyOptions } =
+      opts.deliver === true && sessionEntry?.channel
+        ? (getChannelPlugin(sessionEntry.channel)?.outbound?.createOutboundDispatcher?.({
+            cfg,
+            runtime: getChannelRuntime(sessionEntry.channel) as PluginRuntime,
+            agentId: sessionAgentId,
+            chatId: sessionEntry.lastTo!,
+            threadId: sessionEntry.lastThreadId,
+            messageTo: sessionEntry.lastTo,
+            messageThreadId: sessionEntry.lastThreadId,
+          }) ?? {})
+        : {};
+
+    const streamingBridge =
+      opts.deliver === true && bridgeReplyOptions
+        ? createAgentStreamingBridge({
+            runId,
+            replyOptions: bridgeReplyOptions,
+            onBlockReply: bridgeReplyOptions.onPartialReply
+              ? (payload: ReplyPayload) => {
+                  // Synthesize block reply from partial for legacy bridge consumers
+                  void bridgeReplyOptions.onPartialReply?.(payload);
+                }
+              : undefined,
+          })
+        : undefined;
 
     if (acpResolution?.kind === "ready" && sessionKey) {
       const startedAt = Date.now();
@@ -1136,7 +1183,9 @@ async function agentCommandInternal(
             sessionStore,
             storePath,
             allowTransientCooldownProbe: runOptions?.allowTransientCooldownProbe,
+            ...streamingBridge?.handlers,
             onAgentEvent: (evt) => {
+              streamingBridge?.handleAgentEvent(evt);
               // Track lifecycle end for fallback emission below.
               if (
                 evt.stream === "lifecycle" &&

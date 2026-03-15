@@ -1,10 +1,13 @@
 import fs from "fs";
 import path from "path";
 import type { ChannelOutboundAdapter } from "openclaw/plugin-sdk/feishu";
-import { resolveFeishuAccount } from "./accounts.js";
+import { resolveFeishuAccount, resolveFeishuCredentials } from "./accounts.js";
+import { createFeishuClient } from "./client.js";
 import { sendMediaFeishu } from "./media.js";
 import { getFeishuRuntime } from "./runtime.js";
 import { sendMarkdownCardFeishu, sendMessageFeishu } from "./send.js";
+import { FeishuStreamingSession, mergeStreamingText } from "./streaming-card.js";
+import { resolveReceiveIdType } from "./targets.js";
 
 function normalizePossibleLocalImagePath(text: string | undefined): string | null {
   const raw = text?.trim();
@@ -172,5 +175,70 @@ export const feishuOutbound: ChannelOutboundAdapter = {
       replyToMessageId,
     });
     return { channel: "feishu", ...result };
+  },
+  createOutboundDispatcher: (params) => {
+    const { cfg, accountId, chatId, threadId } = params;
+    const account = resolveFeishuAccount({ cfg, accountId });
+    const creds = resolveFeishuCredentials(account.config);
+    if (!creds) {
+      return {};
+    }
+
+    let streaming: FeishuStreamingSession | null = null;
+    let streamText = "";
+
+    const startStreaming = async () => {
+      if (streaming) return;
+      streaming = new FeishuStreamingSession(
+        createFeishuClient({
+          accountId: account.accountId,
+          appId: creds.appId,
+          appSecret: creds.appSecret,
+          domain: creds.domain,
+          httpTimeoutMs: account.config.httpTimeoutMs,
+        }),
+        {
+          appId: creds.appId,
+          appSecret: creds.appSecret,
+          domain: account.domain,
+        },
+      );
+      await streaming.start(chatId, resolveReceiveIdType(chatId), {
+        replyToMessageId: threadId ? String(threadId) : undefined,
+        replyInThread: true,
+        rootId: threadId ? String(threadId) : undefined,
+      });
+    };
+
+    return {
+      dispatcher: async (payload) => {
+        if (!payload.text) {
+          return;
+        }
+        await startStreaming();
+        streamText = mergeStreamingText(streamText, payload.text);
+        if (streaming) {
+          await streaming.update(streamText);
+        }
+      },
+      replyOptions: {
+        onPartialReply: async (payload) => {
+          if (!payload.text) {
+            return;
+          }
+          await startStreaming();
+          streamText = mergeStreamingText(streamText, payload.text);
+          if (streaming) {
+            await streaming.update(streamText);
+          }
+        },
+        onIdle: async () => {
+          if (streaming) {
+            await streaming.close(streamText);
+            streaming = null;
+          }
+        },
+      },
+    };
   },
 };

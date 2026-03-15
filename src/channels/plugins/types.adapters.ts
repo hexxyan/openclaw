@@ -105,6 +105,27 @@ export type ChannelOutboundPayloadContext = ChannelOutboundContext & {
   payload: ReplyPayload;
 };
 
+export type ChannelOutboundDispatcherParams = {
+  cfg: OpenClawConfig;
+  runtime: PluginRuntime;
+  agentId: string;
+  chatId: string;
+  threadId?: string | number | null;
+  accountId?: string | null;
+  messageTo?: string;
+  messageThreadId?: string | number | null;
+};
+
+export type ChannelOutboundDispatcherResult = {
+  dispatcher?: (payload: ReplyPayload) => Promise<void>;
+  replyOptions?: {
+    onPartialReply?: (payload: ReplyPayload) => Promise<void>;
+    onIdle?: () => Promise<void>;
+    onCleanup?: () => void;
+    disableBlockStreaming?: boolean;
+  };
+};
+
 export type ChannelOutboundAdapter = {
   deliveryMode: "direct" | "gateway" | "hybrid";
   chunker?: ((text: string, limit: number) => string[]) | null;
@@ -122,6 +143,9 @@ export type ChannelOutboundAdapter = {
   sendText?: (ctx: ChannelOutboundContext) => Promise<OutboundDeliveryResult>;
   sendMedia?: (ctx: ChannelOutboundContext) => Promise<OutboundDeliveryResult>;
   sendPoll?: (ctx: ChannelPollContext) => Promise<ChannelPollResult>;
+  createOutboundDispatcher?: (
+    params: ChannelOutboundDispatcherParams,
+  ) => ChannelOutboundDispatcherResult;
 };
 
 export type ChannelStatusAdapter<ResolvedAccount, Probe = unknown, Audit = unknown> = {
