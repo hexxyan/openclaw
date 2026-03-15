@@ -198,15 +198,17 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
 
   const getCoolToolMessage = (toolName: string): string => {
     const messages: Record<string, string> = {
-      exec: "使用工具 💻 exec 处理，请稍等...",
-      google_search: "使用工具 🔍 google_search 处理，请稍等...",
-      duckduckgo_search: "使用工具 🔍 duckduckgo_search 处理，请稍等...",
-      bing_search: "使用工具 🔍 bing_search 处理，请稍等...",
-      compaction: "正在整理深度记忆碎片 🧠，请稍等...",
-      thinking: "正在深度思考中 💭，请稍等...",
-      writing: "正在生成回复内容 ✍️，请稍等...",
+      exec: "💻 使用工具 exec 处理，请稍等...",
+      google_search: "🔍 使用工具 google_search 处理，请稍等...",
+      duckduckgo_search: "🔍 使用工具 duckduckgo_search 处理，请稍等...",
+      bing_search: "🔍 使用工具 bing_search 处理，请稍等...",
+      sessions_spawn: "🤖 正在召唤子代理，请稍等...",
+      web_search: "🌍 正在搜索互联网，请稍等...",
+      compaction: "🧹 正在整理深度记忆碎片，请稍等...",
+      thinking: "🤔 正在深度思考中，请稍等...",
+      writing: "✍️ 正在生成回复内容，请稍等...",
     };
-    return messages[toolName] ?? `使用工具 ${toolName} 处理，请稍等...`;
+    return messages[toolName] ?? `🛠️ 使用工具 ${toolName} 处理，请稍等...`;
   };
 
   const buildStreamingContent = (text: string) => {
