@@ -59,7 +59,7 @@ import {
   SILENT_REPLY_TOKEN,
 } from "../auto-reply/tokens.js";
 import { ReplyPayload } from "../auto-reply/types.js";
-import { getChannelPlugin } from "../channels/plugins/index.js";
+import { getChannelPlugin, type OutboundDispatcher } from "../channels/plugins/index.js";
 import { formatCliCommand } from "../cli/command-format.js";
 import { resolveCommandSecretRefsViaGateway } from "../cli/command-secret-gateway.js";
 import { getAgentRuntimeCommandSecretTargetIds } from "../cli/command-secret-targets.js";
@@ -348,6 +348,18 @@ function runAgentAttempt(params: {
   sessionStore?: Record<string, SessionEntry>;
   storePath?: string;
   allowTransientCooldownProbe?: boolean;
+  streamingHandlers?: {
+    onPartialReply?: (payload: { text?: string; mediaUrls?: string[] }) => void | Promise<void>;
+    onAssistantMessageStart?: () => void | Promise<void>;
+    onReasoningStream?: (payload: { text?: string; mediaUrls?: string[] }) => void | Promise<void>;
+    onReasoningEnd?: () => void | Promise<void>;
+    onToolStart?: (payload: { name?: string; phase?: string }) => void | Promise<void>;
+    onToolResult?: (payload: ReplyPayload) => void | Promise<void>;
+    onCompactionStart?: () => void | Promise<void>;
+    onCompactionEnd?: () => void | Promise<void>;
+    onBlockReply?: (payload: { text?: string; mediaUrls?: string[] }) => void | Promise<void>;
+    disableBlockStreaming?: boolean;
+  };
 }) {
   const effectivePrompt = resolveFallbackRetryPrompt({
     body: params.body,
@@ -506,6 +518,7 @@ function runAgentAttempt(params: {
     onAgentEvent: params.onAgentEvent,
     bootstrapPromptWarningSignaturesSeen,
     bootstrapPromptWarningSignature,
+    ...params.streamingHandlers,
   });
 }
 
@@ -726,6 +739,7 @@ async function agentCommandInternal(
     acpResolution,
   } = prepared;
   let sessionEntry = prepared.sessionEntry;
+  let streamingBridge: OutboundDispatcher | undefined = undefined;
 
   try {
     if (opts.deliver === true) {
@@ -741,36 +755,47 @@ async function agentCommandInternal(
       }
     }
 
+    if (opts.deliver === true || opts.lane === AGENT_LANE_SUBAGENT) {
+      const targetChannel = opts.channel || sessionEntry?.channel || cfg.channels?.default;
+      const targetTo = opts.to || sessionEntry?.lastTo || sessionEntry?.origin?.to;
+      const targetAccountId =
+        opts.accountId || sessionEntry?.lastAccountId || sessionEntry?.origin?.accountId;
+      if (targetChannel && targetTo) {
+        const plugin = getChannelPlugin(targetChannel);
+        if (plugin?.createOutboundDispatcher) {
+          const channelBridge = plugin.createOutboundDispatcher({
+            cfg,
+            agentId: sessionAgentId,
+            runtime,
+            to: targetTo,
+            accountId: targetAccountId,
+            threadId: opts.threadId,
+            replyToId: opts.replyTo,
+          });
+          // Build streamingBridge with onBlockReply synthesized from onPartialReply
+          // so that shouldEmitPartialReplies is true in the subscription handler
+          // (it requires onBlockReply when reasoningMode is "on").
+          const bridgeReplyOptions = channelBridge.replyOptions ?? {};
+          if (bridgeReplyOptions.onPartialReply && !bridgeReplyOptions.onBlockReply) {
+            bridgeReplyOptions.onBlockReply = bridgeReplyOptions.onPartialReply;
+          }
+          // Map onReplyStart to onAssistantMessageStart for the agent runner
+          if (bridgeReplyOptions.onReplyStart && !bridgeReplyOptions.onAssistantMessageStart) {
+            bridgeReplyOptions.onAssistantMessageStart = bridgeReplyOptions.onReplyStart;
+          }
+          streamingBridge = {
+            ...channelBridge,
+            replyOptions: bridgeReplyOptions,
+          };
+        }
+      }
+    }
+
     if (acpResolution?.kind === "stale") {
       throw acpResolution.error;
     }
 
-    const { replyOptions: bridgeReplyOptions } =
-      opts.deliver === true && sessionEntry?.channel
-        ? (getChannelPlugin(sessionEntry.channel)?.outbound?.createOutboundDispatcher?.({
-            cfg,
-            runtime: getChannelRuntime(sessionEntry.channel) as PluginRuntime,
-            agentId: sessionAgentId,
-            chatId: sessionEntry.lastTo!,
-            threadId: sessionEntry.lastThreadId,
-            messageTo: sessionEntry.lastTo,
-            messageThreadId: sessionEntry.lastThreadId,
-          }) ?? {})
-        : {};
-
-    const streamingBridge =
-      opts.deliver === true && bridgeReplyOptions
-        ? createAgentStreamingBridge({
-            runId,
-            replyOptions: bridgeReplyOptions,
-            onBlockReply: bridgeReplyOptions.onPartialReply
-              ? (payload: ReplyPayload) => {
-                  // Synthesize block reply from partial for legacy bridge consumers
-                  void bridgeReplyOptions.onPartialReply?.(payload);
-                }
-              : undefined,
-          })
-        : undefined;
+    const bridgeReplyOptions = streamingBridge?.replyOptions;
 
     if (acpResolution?.kind === "ready" && sessionKey) {
       const startedAt = Date.now();
@@ -1183,9 +1208,8 @@ async function agentCommandInternal(
             sessionStore,
             storePath,
             allowTransientCooldownProbe: runOptions?.allowTransientCooldownProbe,
-            ...streamingBridge?.handlers,
+            streamingHandlers: streamingBridge?.replyOptions,
             onAgentEvent: (evt) => {
-              streamingBridge?.handleAgentEvent(evt);
               // Track lifecycle end for fallback emission below.
               if (
                 evt.stream === "lifecycle" &&
@@ -1263,6 +1287,9 @@ async function agentCommandInternal(
       payloads,
     });
   } finally {
+    if (streamingBridge?.markDispatchIdle) {
+      await streamingBridge.markDispatchIdle();
+    }
     clearAgentRunContext(runId);
   }
 }

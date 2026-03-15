@@ -106,6 +106,7 @@ export async function probeFeishu(
     }
 
     const response = responseResult.value;
+
     if (options.abortSignal?.aborted) {
       return {
         ok: false,

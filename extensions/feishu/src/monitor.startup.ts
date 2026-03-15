@@ -42,16 +42,13 @@ export async function fetchBotIdentityForMonitor(
     return { botOpenId: result.botOpenId, botName: result.botName };
   }
 
+  const logError = options.runtime?.error ?? console.error;
+  logError(`feishu[${account.accountId}]: bot info probe failed: ${result.error || 'unknown error'}`);
+
   if (options.abortSignal?.aborted || isAbortErrorMessage(result.error)) {
     return {};
   }
 
-  if (isTimeoutErrorMessage(result.error)) {
-    const error = options.runtime?.error ?? console.error;
-    error(
-      `feishu[${account.accountId}]: bot info probe timed out after ${timeoutMs}ms; continuing startup`,
-    );
-  }
   return {};
 }
 

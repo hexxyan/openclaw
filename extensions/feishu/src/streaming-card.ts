@@ -4,10 +4,25 @@
 
 import type { Client } from "@larksuiteoapi/node-sdk";
 import { fetchWithSsrFGuard } from "openclaw/plugin-sdk/feishu";
+import { resolveFeishuCardTemplate, type CardHeaderConfig } from "./send.js";
 import type { FeishuDomain } from "./types.js";
 
 type Credentials = { appId: string; appSecret: string; domain?: FeishuDomain };
-type CardState = { cardId: string; messageId: string; sequence: number; currentText: string };
+interface CardState {
+  cardId: string;
+  messageId: string;
+  sequence: number;
+  currentText: string;
+  hasNote: boolean;
+}
+
+/** Options for customising the initial streaming card appearance. */
+export type StreamingCardOptions = {
+  /** Optional header with title and color template. */
+  header?: CardHeaderConfig;
+  /** Optional grey note footer text. */
+  note?: string;
+};
 
 /** Optional header for streaming cards (title bar with color template) */
 export type StreamingCardHeader = {
@@ -151,7 +166,8 @@ export class FeishuStreamingSession {
   private closed = false;
   private log?: (msg: string) => void;
   private lastUpdateTime = 0;
-  private pendingText: string | null = null;
+  private pendingText: string | undefined = undefined;
+  private flushTimer: ReturnType<typeof setTimeout> | null = null;
   private updateThrottleMs = 100; // Throttle updates to max 10/sec
 
   constructor(client: Client, creds: Credentials, log?: (msg: string) => void) {
@@ -163,13 +179,24 @@ export class FeishuStreamingSession {
   async start(
     receiveId: string,
     receiveIdType: "open_id" | "user_id" | "union_id" | "email" | "chat_id" = "chat_id",
-    options?: StreamingStartOptions,
+    options?: StreamingCardOptions & StreamingStartOptions,
   ): Promise<void> {
     if (this.state) {
       return;
     }
 
     const apiBase = resolveApiBase(this.creds.domain);
+    const elements: Record<string, unknown>[] = [
+      { tag: "markdown", content: "⏳ Thinking...", element_id: "content" },
+    ];
+    if (options?.note) {
+      elements.push({ tag: "hr" });
+      elements.push({
+        tag: "markdown",
+        content: `<font color='grey'>${options.note}</font>`,
+        element_id: "note",
+      });
+    }
     const cardJson: Record<string, unknown> = {
       schema: "2.0",
       config: {
@@ -177,14 +204,12 @@ export class FeishuStreamingSession {
         summary: { content: "[Generating...]" },
         streaming_config: { print_frequency_ms: { default: 50 }, print_step: { default: 1 } },
       },
-      body: {
-        elements: [{ tag: "markdown", content: "⏳ Thinking...", element_id: "content" }],
-      },
+      body: { elements },
     };
     if (options?.header) {
       cardJson.header = {
         title: { tag: "plain_text", content: options.header.title },
-        template: options.header.template ?? "blue",
+        template: resolveFeishuCardTemplate(options.header.template) ?? "blue",
       };
     }
 
@@ -257,7 +282,13 @@ export class FeishuStreamingSession {
       throw new Error(`Send card failed: ${sendRes.msg}`);
     }
 
-    this.state = { cardId, messageId: sendRes.data.message_id, sequence: 1, currentText: "" };
+    this.state = {
+      cardId,
+      messageId: sendRes.data.message_id,
+      sequence: 1,
+      currentText: "⏳ Thinking...",
+      hasNote: !!options?.note,
+    };
     this.log?.(`Started streaming: cardId=${cardId}, messageId=${sendRes.data.message_id}`);
   }
 
@@ -276,7 +307,7 @@ export class FeishuStreamingSession {
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          content: text,
+          content: text ?? "",
           sequence: this.state.sequence,
           uuid: `s_${this.state.cardId}_${this.state.sequence}`,
         }),
@@ -290,6 +321,7 @@ export class FeishuStreamingSession {
       .catch((error) => onError?.(error));
   }
 
+  /** Normal streaming update (append/merge) */
   async update(text: string): Promise<void> {
     if (!this.state || this.closed) {
       return;
@@ -299,21 +331,24 @@ export class FeishuStreamingSession {
       return;
     }
 
-    // Throttle: skip if updated recently, but remember pending text
     const now = Date.now();
     if (now - this.lastUpdateTime < this.updateThrottleMs) {
       this.pendingText = mergedInput;
       return;
     }
-    this.pendingText = null;
+    this.pendingText = undefined;
     this.lastUpdateTime = now;
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+    }
 
     this.queue = this.queue.then(async () => {
       if (!this.state || this.closed) {
         return;
       }
       const mergedText = mergeStreamingText(this.state.currentText, mergedInput);
-      if (!mergedText || mergedText === this.state.currentText) {
+      if (mergedText === this.state.currentText) {
         return;
       }
       this.state.currentText = mergedText;
@@ -322,21 +357,80 @@ export class FeishuStreamingSession {
     await this.queue;
   }
 
-  async close(finalText?: string): Promise<void> {
+  /** Direct replacement (snapshot) update - allows shrinking or clearing content */
+  async replaceContent(text: string, options?: { note?: string }): Promise<void> {
+    if (!this.state || this.closed) {
+      return;
+    }
+    this.pendingText = undefined; // Drop pending async updates
+    this.queue = this.queue.then(async () => {
+      if (!this.state || this.closed) {
+        return;
+      }
+      this.state.currentText = text;
+      const updates: Promise<void>[] = [
+        this.updateCardContent(text, (e) => this.log?.(`ReplaceContent failed: ${String(e)}`)),
+      ];
+      if (options?.note) {
+        updates.push(this.updateNoteContent(options.note));
+      }
+      await Promise.all(updates);
+    });
+    await this.queue;
+  }
+
+  private async updateNoteContent(note: string): Promise<void> {
+    if (!this.state || !this.state.hasNote) {
+      return;
+    }
+    const apiBase = resolveApiBase(this.creds.domain);
+    this.state.sequence += 1;
+    await fetchWithSsrFGuard({
+      url: `${apiBase}/cardkit/v1/cards/${this.state.cardId}/elements/note/content`,
+      init: {
+        method: "PUT",
+        headers: {
+          Authorization: `Bearer ${await getToken(this.creds)}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          content: `<font color='grey'>${note}</font>`,
+          sequence: this.state.sequence,
+          uuid: `n_${this.state.cardId}_${this.state.sequence}`,
+        }),
+      },
+      policy: { allowedHostnames: resolveAllowedHostnames(this.creds.domain) },
+      auditContext: "feishu.streaming-card.note-update",
+    })
+      .then(async ({ release }) => {
+        await release();
+      })
+      .catch((e) => this.log?.(`Note update failed: ${String(e)}`));
+  }
+
+  async close(finalText?: string, options?: { note?: string }): Promise<void> {
     if (!this.state || this.closed) {
       return;
     }
     this.closed = true;
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+    }
     await this.queue;
 
-    const pendingMerged = mergeStreamingText(this.state.currentText, this.pendingText ?? undefined);
-    const text = finalText ? mergeStreamingText(pendingMerged, finalText) : pendingMerged;
+    const currentText = this.state.currentText;
+    const text = finalText ?? currentText;
     const apiBase = resolveApiBase(this.creds.domain);
 
-    // Only send final update if content differs from what's already displayed
-    if (text && text !== this.state.currentText) {
+    if (text !== currentText) {
       await this.updateCardContent(text);
       this.state.currentText = text;
+    }
+
+    // Update note with final model/provider info
+    if (options?.note) {
+      await this.updateNoteContent(options.note);
     }
 
     // Close streaming mode
@@ -364,8 +458,11 @@ export class FeishuStreamingSession {
         await release();
       })
       .catch((e) => this.log?.(`Close failed: ${String(e)}`));
+    const finalState = this.state;
+    this.state = null;
+    this.pendingText = undefined;
 
-    this.log?.(`Closed streaming: cardId=${this.state.cardId}`);
+    this.log?.(`Closed streaming: cardId=${finalState.cardId}`);
   }
 
   isActive(): boolean {
